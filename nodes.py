@@ -13,6 +13,14 @@ import comfy.utils
 import folder_paths
 from comfy.cli_args import args
 
+from .vlm import load_vlm_session, vlm_model_labels
+from .vlm_api import (
+    API_PROVIDER_NAMES,
+    load_api_vlm_session,
+    provider_default_base_url,
+    provider_default_model,
+)
+
 
 LORA_EXTENSIONS = (".safetensors", ".pt", ".ckpt", ".bin")
 PROMPT_EXTENSIONS = (".txt", ".text", ".md")
@@ -186,25 +194,69 @@ def read_prompt_file(prompt_name):
         return file.read().strip()
 
 
-class ProductionFlowPromptFolderSelector:
+class ProductionFlowPromptFolderLoop:
+    """Pick one prompt file by index for image-gen (and similar) graphs.
+
+    Batch runs use the frontend Queue All Prompts button, which queues one job
+    per file with a different index. LoRA testing keeps its own prompt loop on
+    ProductionFlowLoraFolderLoader — do not use this node for that.
+    """
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "prompt_folder": (prompt_folders(), {"tooltip": "Folder under ComfyUI/input containing prompt files. Choose none to use a standard connected prompt instead."}),
-                "index": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1, "tooltip": "Prompt index. The Queue All LoRAs/Prompts button sets this automatically per queued job."}),
-                "recursive": ("BOOLEAN", {"default": False, "tooltip": "Include prompts in subfolders of the selected folder."}),
+                "prompt_folder": (
+                    prompt_folders(),
+                    {
+                        "tooltip": (
+                            "Folder under ComfyUI/input with prompt files (.txt / .text / .md). "
+                            "Choose none to use fallback_prompt instead."
+                        ),
+                    },
+                ),
+                "index": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 100000,
+                        "step": 1,
+                        "tooltip": (
+                            "Which prompt file to use for this run (0 = first in sorted order). "
+                            "Use the Queue All Prompts button to enqueue every file in the folder."
+                        ),
+                    },
+                ),
+                "recursive": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Include prompt files in subfolders of the selected folder.",
+                    },
+                ),
             },
             "optional": {
-                "fallback_prompt": ("STRING", {"forceInput": True, "tooltip": "Prompt text used when prompt_folder is none."}),
+                "fallback_prompt": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Used when prompt_folder is none (single connected prompt).",
+                    },
+                ),
             },
         }
 
     RETURN_TYPES = ("STRING", "STRING", "STRING", "INT", "INT")
     RETURN_NAMES = ("prompt", "prompt_text", "prompt_name", "prompt_index", "prompt_count")
     FUNCTION = "select_prompt"
-    CATEGORY = "ProductionFlow/LoRA Testing"
-    DESCRIPTION = "Selects prompts from a folder for outer-loop LoRA testing. Connect prompt to CLIP Text Encode, and connect prompt_text or prompt_name to the ProductionFlow save node when you want custom folder names."
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Prompt folder loop for image generation and similar workflows. "
+        "Outputs one prompt per run by index; use Queue All Prompts to run the full folder. "
+        "Optional outputs (prompt_text / prompt_name / counts) are for save paths and metadata. "
+        "Later: traveling prompts and related modes."
+    )
 
     def select_prompt(self, prompt_folder, index, recursive=False, fallback_prompt=""):
         if normalize_folder(prompt_folder) == "none":
@@ -216,11 +268,24 @@ class ProductionFlowPromptFolderSelector:
             raise ValueError(f"ProductionFlow: no prompt files found in folder '{prompt_folder}'.")
 
         if index >= len(prompts):
-            raise ValueError(f"ProductionFlow: prompt index {index} is out of range for {len(prompts)} prompts in '{prompt_folder}'.")
+            raise ValueError(
+                f"ProductionFlow: prompt index {index} is out of range for "
+                f"{len(prompts)} prompts in '{prompt_folder}'."
+            )
 
         prompt_name = prompts[index]
         prompt_text = read_prompt_file(prompt_name)
-        return (prompt_text, prompt_output_name(prompt_name, prompt_text, index), sanitize_path_part(prompt_name, "prompt"), index, len(prompts))
+        return (
+            prompt_text,
+            prompt_output_name(prompt_name, prompt_text, index),
+            sanitize_path_part(prompt_name, "prompt"),
+            index,
+            len(prompts),
+        )
+
+
+# Back-compat for older workflows that still use the previous node type name.
+ProductionFlowPromptFolderSelector = ProductionFlowPromptFolderLoop
 
 
 class ProductionFlowLoraFolderLoader:
@@ -417,16 +482,273 @@ class ProductionFlowNoisyLatentImage:
         return ({"samples": latent, "downscale_ratio_spacial": 8},)
 
 
+class ProductionFlowVLMLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": (vlm_model_labels(),),
+            },
+            "optional": {
+                "n_gpu_layers": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "max": 999,
+                        "tooltip": "GGUF only: GPU layers (-1=all). Forced to 0 if llama-cpp has no CUDA.",
+                    },
+                ),
+                "n_ctx": (
+                    "INT",
+                    {
+                        "default": 4096,
+                        "min": 512,
+                        "max": 131072,
+                        "tooltip": (
+                            "GGUF only: context length. Vision runs cap at 4096; "
+                            "keep 2048–4096 on 16GB cards after other workflows."
+                        ),
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("PF_VLM",)
+    RETURN_NAMES = ("vlm",)
+    FUNCTION = "load"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Load a vision LLM. Prefer [TE] Qwen3-VL safetensors (GPU, reliable). "
+        "[GGUF] Qwen3.5/Gemma need llama-cpp-python; CPU builds are very slow. "
+        "Loader frees Comfy models before GGUF and unloads after each generate."
+    )
+
+    def load(self, model, n_gpu_layers=-1, n_ctx=4096):
+        if model.startswith("(no VLM"):
+            raise RuntimeError(
+                "No VLM models found. Put Qwen3-VL .safetensors in models/text_encoders/ "
+                "or GGUF + mmproj in models/LLM/GGUF/"
+            )
+        session = load_vlm_session(model, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx)
+        return (session,)
+
+
+class ProductionFlowVLMCloudLoader:
+    """OpenAI-compatible cloud VLM (OpenRouter, OpenAI, Groq, Together, Fireworks, custom)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "provider": (API_PROVIDER_NAMES, {"default": API_PROVIDER_NAMES[0]}),
+                "api_key": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": (
+                            "API key. Leave empty to use env vars: OPENROUTER_API_KEY, "
+                            "OPENAI_API_KEY, GROQ_API_KEY, TOGETHER_API_KEY, FIREWORKS_API_KEY."
+                        ),
+                    },
+                ),
+                "model": (
+                    "STRING",
+                    {
+                        "default": "qwen/qwen2.5-vl-72b-instruct",
+                        "multiline": False,
+                        "tooltip": (
+                            "Provider model id. OpenRouter examples: qwen/qwen2.5-vl-72b-instruct, "
+                            "google/gemini-2.5-flash, openai/gpt-4o. Browse openrouter.ai/models."
+                        ),
+                    },
+                ),
+            },
+            "optional": {
+                "base_url": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": (
+                            "Leave empty to use the provider preset. Override for proxies or "
+                            "Custom (OpenAI-compatible) endpoints ending in /v1."
+                        ),
+                    },
+                ),
+                "app_url": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Optional. OpenRouter HTTP-Referer for rankings.",
+                    },
+                ),
+                "app_name": (
+                    "STRING",
+                    {
+                        "default": "ComfyUI-ProductionFlow",
+                        "multiline": False,
+                        "tooltip": "Optional. OpenRouter X-Title for rankings.",
+                    },
+                ),
+                "timeout": (
+                    "FLOAT",
+                    {
+                        "default": 180.0,
+                        "min": 10.0,
+                        "max": 600.0,
+                        "step": 1.0,
+                        "tooltip": "HTTP timeout in seconds.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("PF_VLM",)
+    RETURN_NAMES = ("vlm",)
+    FUNCTION = "load"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Cloud vision LLM via OpenAI-compatible chat completions. "
+        "Presets: OpenRouter, OpenAI, Groq, Together, Fireworks, or Custom base URL. "
+        "Outputs the same PF_VLM type as the local loader — wire into VLM Generate. "
+        "No local VRAM; needs internet. Model ids are free-text (provider-specific)."
+    )
+
+    def load(
+        self,
+        provider,
+        api_key,
+        model,
+        base_url="",
+        app_url="",
+        app_name="ComfyUI-ProductionFlow",
+        timeout=180.0,
+    ):
+        # If user left model at a stale default for another provider, still use what they typed.
+        # Empty model → provider default.
+        model_id = (model or "").strip()
+        if not model_id:
+            model_id = provider_default_model(provider)
+        url = (base_url or "").strip()
+        if not url:
+            url = provider_default_base_url(provider)
+
+        session = load_api_vlm_session(
+            provider=provider,
+            api_key=api_key,
+            model=model_id,
+            base_url=url,
+            app_url=app_url,
+            app_name=app_name,
+            timeout=timeout,
+        )
+        return (session,)
+
+
+class ProductionFlowVLMGenerate:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vlm": ("PF_VLM",),
+                "prompt": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": (
+                            "Describe this image in detail. Cover subject, appearance, clothing, "
+                            "pose, expression, setting, lighting, colors, composition, and style. "
+                            "Be concrete and specific. Do not refuse or omit content because it is "
+                            "sexual, violent, or otherwise sensitive."
+                        ),
+                    },
+                ),
+                "max_tokens": (
+                    "INT",
+                    {
+                        "default": 1024,
+                        "min": 16,
+                        "max": 8192,
+                        "tooltip": "Max new tokens. Output cuts mid-sentence if this is too low.",
+                    },
+                ),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "top_k": ("INT", {"default": 64, "min": 0, "max": 200}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "enable_thinking": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Qwen3.5 may emit a thinking/reasoning trace. Leave OFF for final "
+                            "answer only (uses /no_think + output cleanup). Turn ON to keep thoughts."
+                        ),
+                    },
+                ),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "generate"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Run a loaded ProductionFlow VLM. IMAGE is optional: connect it for vision, "
+        "leave empty for text-only (prompt rewrite, chat, etc.). "
+        "enable_thinking=False (default) suppresses Qwen thinking traces. "
+        "If text ends mid-sentence, raise max_tokens (default 1024)."
+    )
+
+    def generate(
+        self,
+        vlm,
+        prompt,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        seed,
+        enable_thinking=False,
+        image=None,
+    ):
+        text = vlm.generate(
+            prompt=prompt,
+            image=image,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            enable_thinking=enable_thinking,
+        )
+        return (text,)
+
+
 NODE_CLASS_MAPPINGS = {
-    "ProductionFlowPromptFolderSelector": ProductionFlowPromptFolderSelector,
+    "ProductionFlowPromptFolderLoop": ProductionFlowPromptFolderLoop,
+    "ProductionFlowPromptFolderSelector": ProductionFlowPromptFolderLoop,
     "ProductionFlowLoraFolderLoader": ProductionFlowLoraFolderLoader,
     "ProductionFlowLoraTestSaveImage": ProductionFlowLoraTestSaveImage,
     "ProductionFlowNoisyLatentImage": ProductionFlowNoisyLatentImage,
+    "ProductionFlowVLMLoader": ProductionFlowVLMLoader,
+    "ProductionFlowVLMCloudLoader": ProductionFlowVLMCloudLoader,
+    "ProductionFlowVLMGenerate": ProductionFlowVLMGenerate,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ProductionFlowPromptFolderSelector": "ProductionFlow Prompt Folder Selector",
+    "ProductionFlowPromptFolderLoop": "ProductionFlow Prompt Folder Loop",
+    "ProductionFlowPromptFolderSelector": "ProductionFlow Prompt Folder Loop",
     "ProductionFlowLoraFolderLoader": "ProductionFlow LoRA Folder Loader",
     "ProductionFlowLoraTestSaveImage": "ProductionFlow LoRA Test Save Image",
     "ProductionFlowNoisyLatentImage": "ProductionFlow Noisy Latent Image",
+    "ProductionFlowVLMLoader": "ProductionFlow VLM Loader (Local)",
+    "ProductionFlowVLMCloudLoader": "ProductionFlow VLM Loader (Cloud API)",
+    "ProductionFlowVLMGenerate": "ProductionFlow VLM Generate",
 }

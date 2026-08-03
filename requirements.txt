@@ -1,0 +1,6 @@
+# Optional: required only for local GGUF VLMs (Qwen3.5 / Gemma).
+# Safetensors Qwen3-VL works with stock ComfyUI only.
+# Cloud VLM (OpenRouter / OpenAI / Groq / Together / Fireworks) needs no extra deps.
+# CUDA build example:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+llama-cpp-python>=0.3.0
