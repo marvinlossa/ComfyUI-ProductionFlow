@@ -13,6 +13,9 @@ import comfy.utils
 import folder_paths
 from comfy.cli_args import args
 
+from comfy.utils import ProgressBar
+
+from .motion_blur_film_grain import apply_motion_blur_film_grain, progress_total
 from .vlm import load_vlm_session, vlm_model_labels
 from .vlm_api import (
     API_PROVIDER_NAMES,
@@ -731,6 +734,150 @@ class ProductionFlowVLMGenerate:
         return (text,)
 
 
+class ProductionFlowMotionBlurFilmGrain:
+    """Temporal motion blur then film grain on a video frame batch.
+
+    Connect IMAGE frames the same way you would to VHS Video Combine. This node
+    returns processed IMAGE frames so you can wire them into Video Combine (or
+    any other image consumer). No MP4 is written here.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": (
+                    "IMAGE",
+                    {
+                        "tooltip": (
+                            "Video frame batch (N, H, W, C), same IMAGE type as "
+                            "VHS Video Combine. Process frames here, then connect "
+                            "the output into Video Combine for export."
+                        ),
+                    },
+                ),
+                "enable_blur": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Apply temporal motion blur (tmix-style). Off = leave frames sharp.",
+                    },
+                ),
+                "blur_window": (
+                    "INT",
+                    {
+                        "default": 3,
+                        "min": 1,
+                        "max": 31,
+                        "step": 2,
+                        "tooltip": (
+                            "Odd frame window for temporal blur (ffmpeg tmix frames). "
+                            "1 = no blur. 3 = light (default). 5–7 = medium. 9+ = heavy smear. "
+                            "Even values are rounded up to the next odd number."
+                        ),
+                    },
+                ),
+                "blur_strength": (
+                    "FLOAT",
+                    {
+                        "default": 0.35,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "tooltip": (
+                            "Neighbor-frame blend weight (center frame weight is always 1). "
+                            "0 = disabled. ~0.2 = subtle. 0.35 = default balanced. "
+                            "0.5–0.8 = strong ghosting. 1.0+ = very heavy mix."
+                        ),
+                    },
+                ),
+                "enable_grain": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Apply film grain after blur so grain stays crisp.",
+                    },
+                ),
+                "grain_strength": (
+                    "FLOAT",
+                    {
+                        "default": 6.0,
+                        "min": 0.0,
+                        "max": 50.0,
+                        "step": 0.5,
+                        "tooltip": (
+                            "Film grain strength on an 8-bit-style scale (ffmpeg noise alls). "
+                            "0 = off. 2–4 = fine/subtle. 6 = default mild. "
+                            "8–12 = noticeable film stock. 15+ = heavy/gritty."
+                        ),
+                    },
+                ),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "tooltip": "Random seed for grain pattern. Change for a different grain layout.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "process"
+    CATEGORY = "ProductionFlow/Video"
+    DESCRIPTION = (
+        "Apply temporal motion blur first, then film grain, matching the "
+        "MotionBlurFilmGrain filter order. Input/output are IMAGE frame batches "
+        "for use with VHS Video Combine. Does not export video."
+    )
+
+    def process(
+        self,
+        images,
+        enable_blur=True,
+        blur_window=3,
+        blur_strength=0.35,
+        enable_grain=True,
+        grain_strength=6.0,
+        seed=0,
+    ):
+        if images is None or not isinstance(images, torch.Tensor):
+            raise ValueError("ProductionFlow Motion Blur Film Grain: expected an IMAGE tensor.")
+        if images.ndim != 4:
+            raise ValueError(
+                f"ProductionFlow Motion Blur Film Grain: expected NHWC IMAGE batch, "
+                f"got shape {tuple(images.shape)}."
+            )
+
+        total = progress_total(
+            images.shape[0],
+            enable_blur=enable_blur,
+            blur_window=blur_window,
+            blur_strength=blur_strength,
+            enable_grain=enable_grain,
+            grain_strength=grain_strength,
+        )
+        pbar = ProgressBar(total)
+
+        out = apply_motion_blur_film_grain(
+            images,
+            blur_window=blur_window,
+            blur_strength=blur_strength,
+            grain_strength=grain_strength,
+            seed=seed,
+            enable_blur=enable_blur,
+            enable_grain=enable_grain,
+            progress_callback=pbar.update,
+        )
+        # Ensure the bar lands on 100% even for no-op / short paths.
+        if pbar.current < pbar.total:
+            pbar.update_absolute(pbar.total)
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ProductionFlowPromptFolderLoop": ProductionFlowPromptFolderLoop,
     "ProductionFlowPromptFolderSelector": ProductionFlowPromptFolderLoop,
@@ -740,6 +887,7 @@ NODE_CLASS_MAPPINGS = {
     "ProductionFlowVLMLoader": ProductionFlowVLMLoader,
     "ProductionFlowVLMCloudLoader": ProductionFlowVLMCloudLoader,
     "ProductionFlowVLMGenerate": ProductionFlowVLMGenerate,
+    "ProductionFlowMotionBlurFilmGrain": ProductionFlowMotionBlurFilmGrain,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -751,4 +899,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ProductionFlowVLMLoader": "ProductionFlow VLM Loader (Local)",
     "ProductionFlowVLMCloudLoader": "ProductionFlow VLM Loader (Cloud API)",
     "ProductionFlowVLMGenerate": "ProductionFlow VLM Generate",
+    "ProductionFlowMotionBlurFilmGrain": "ProductionFlow Motion Blur Film Grain",
 }
