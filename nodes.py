@@ -15,6 +15,8 @@ from comfy.cli_args import args
 
 from comfy.utils import ProgressBar
 
+from .face_square import _retinaface_class, crop_and_region, paste_mask
+from .image_filters import apply_image_filters
 from .motion_blur_film_grain import apply_motion_blur_film_grain, progress_total
 from .vlm import load_vlm_session, vlm_model_labels
 from .vlm_api import (
@@ -27,6 +29,7 @@ from .vlm_api import (
 
 LORA_EXTENSIONS = (".safetensors", ".pt", ".ckpt", ".bin")
 PROMPT_EXTENSIONS = (".txt", ".text", ".md")
+TEXT_ROOTS = ("input", "output")
 PROMPT_FOLDER_TEXT_CHARS = 20
 MAX_RESOLUTION = 16384
 
@@ -116,53 +119,71 @@ def folder_output_name(lora_folder):
     return sanitize_path_part(folder.split("/")[-1], "lora_test")
 
 
+def text_root_dir(root="input"):
+    name = (root or "input").strip().lower()
+    if name == "output":
+        return folder_paths.get_output_directory()
+    if name == "input":
+        return folder_paths.get_input_directory()
+    raise ValueError("ProductionFlow: unknown text root. Use input or output.")
+
+
 def prompt_root_dir():
-    return folder_paths.get_input_directory()
+    return text_root_dir("input")
 
 
-def prompt_files():
-    root = prompt_root_dir()
+def list_text_files(root="input"):
+    root_dir = text_root_dir(root)
     files = []
-    if not os.path.isdir(root):
+    if not os.path.isdir(root_dir):
         return files
 
-    for current_root, _, names in os.walk(root):
+    for current_root, _, names in os.walk(root_dir):
         for name in names:
             if not name.lower().endswith(PROMPT_EXTENSIONS):
                 continue
             path = os.path.join(current_root, name)
-            relpath = os.path.relpath(path, root).replace("\\", "/")
+            relpath = os.path.relpath(path, root_dir).replace("\\", "/")
             files.append(relpath)
     return sorted(files, key=lambda x: x.lower())
 
 
-def prompt_folders():
-    root = prompt_root_dir()
-    folders = {"none", "."}
-    if not os.path.isdir(root):
-        return ["none", "."]
-
-    for current_root, dirnames, _ in os.walk(root):
+def _walk_subfolders(root_dir):
+    folders = {"."}
+    if not os.path.isdir(root_dir):
+        return folders
+    for current_root, dirnames, _ in os.walk(root_dir):
         dirnames[:] = [name for name in dirnames if not name.startswith(".")]
         for dirname in dirnames:
             path = os.path.join(current_root, dirname)
-            relpath = os.path.relpath(path, root).replace("\\", "/")
-            folders.add(relpath)
-    return sorted(folders, key=lambda x: (x != "none", x == ".", x.lower()))
+            folders.add(os.path.relpath(path, root_dir).replace("\\", "/"))
+    return folders
 
 
-def scan_prompts(prompt_folder, filter_text="", recursive=False):
-    selected = normalize_folder(prompt_folder)
+def list_text_folders(root="input"):
+    folders = _walk_subfolders(text_root_dir(root))
+    return sorted(folders, key=lambda x: (x == ".", x.lower()))
+
+
+def all_text_folders():
+    folders = set()
+    for root in TEXT_ROOTS:
+        folders.update(list_text_folders(root))
+    return sorted(folders, key=lambda x: (x == ".", x.lower())) or ["."]
+
+
+def scan_files_in_folder(files, folder, recursive=False, filter_text=""):
+    selected = normalize_folder(folder)
     if selected == "none":
         return []
 
     filter_text = (filter_text or "").strip().lower()
     out = []
-    for name in prompt_files():
-        folder = os.path.dirname(name).replace("\\", "/") or "."
-        in_folder = folder == selected
+    for name in files:
+        file_folder = os.path.dirname(name).replace("\\", "/") or "."
+        in_folder = file_folder == selected
         if recursive and selected != ".":
-            in_folder = in_folder or folder.startswith(selected + "/")
+            in_folder = in_folder or file_folder.startswith(selected + "/")
         elif recursive and selected == ".":
             in_folder = True
 
@@ -171,8 +192,66 @@ def scan_prompts(prompt_folder, filter_text="", recursive=False):
         if filter_text and filter_text not in name.lower():
             continue
         out.append(name)
-
     return out
+
+
+def scan_text_files(root, folder, recursive=False, filter_text=""):
+    return scan_files_in_folder(list_text_files(root), folder, recursive, filter_text)
+
+
+def list_image_files(root="input"):
+    root_dir = text_root_dir(root)
+    files = []
+    if not os.path.isdir(root_dir):
+        return files
+
+    for current_root, _, names in os.walk(root_dir):
+        for name in folder_paths.filter_files_content_types(names, ["image"]):
+            path = os.path.join(current_root, name)
+            files.append(os.path.relpath(path, root_dir).replace("\\", "/"))
+    return sorted(files, key=lambda x: x.lower())
+
+
+def scan_image_files(root, folder, recursive=False, filter_text=""):
+    return scan_files_in_folder(list_image_files(root), folder, recursive, filter_text)
+
+
+def file_view_info(root, relpath):
+    normalized = relpath.replace("\\", "/").strip("/")
+    subfolder = os.path.dirname(normalized)
+    if subfolder in ("", "."):
+        subfolder = ""
+    return {
+        "filename": os.path.basename(normalized),
+        "subfolder": subfolder,
+        "type": (root or "input").strip().lower(),
+    }
+
+
+def read_text_file(root, relpath, strip=True):
+    root_dir = text_root_dir(root)
+    normalized = relpath.replace("\\", "/").strip("/")
+    path = os.path.abspath(os.path.join(root_dir, normalized))
+    root_abs = os.path.abspath(root_dir)
+    if not path.startswith(root_abs + os.sep) and path != root_abs:
+        raise ValueError("ProductionFlow: text path escapes the selected root.")
+    with open(path, "r", encoding="utf-8") as file:
+        text = file.read()
+    return text.strip() if strip else text
+
+
+def prompt_files():
+    return list_text_files("input")
+
+
+def prompt_folders():
+    folders = _walk_subfolders(prompt_root_dir())
+    folders.add("none")
+    return sorted(folders, key=lambda x: (x != "none", x == ".", x.lower()))
+
+
+def scan_prompts(prompt_folder, filter_text="", recursive=False):
+    return scan_text_files("input", prompt_folder, recursive, filter_text)
 
 
 def prompt_output_name(prompt_name, prompt_text=None, prompt_index=None):
@@ -187,14 +266,7 @@ def prompt_output_name(prompt_name, prompt_text=None, prompt_index=None):
 
 
 def read_prompt_file(prompt_name):
-    root = prompt_root_dir()
-    normalized = prompt_name.replace("\\", "/").strip("/")
-    path = os.path.abspath(os.path.join(root, normalized))
-    root_abs = os.path.abspath(root)
-    if not path.startswith(root_abs + os.sep) and path != root_abs:
-        raise ValueError("ProductionFlow: prompt path escapes the prompt root.")
-    with open(path, "r", encoding="utf-8") as file:
-        return file.read().strip()
+    return read_text_file("input", prompt_name)
 
 
 class ProductionFlowPromptFolderLoop:
@@ -289,6 +361,249 @@ class ProductionFlowPromptFolderLoop:
 
 # Back-compat for older workflows that still use the previous node type name.
 ProductionFlowPromptFolderSelector = ProductionFlowPromptFolderLoop
+
+
+class ProductionFlowTextFolderLoad:
+    """Load every text file in a folder for browsing after one run."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        folders = all_text_folders()
+        default_folder = "Prompts" if "Prompts" in folders else folders[0]
+        return {
+            "required": {
+                "root": (
+                    list(TEXT_ROOTS),
+                    {
+                        "default": "input",
+                        "tooltip": "ComfyUI/input or ComfyUI/output. Folder list is relative to this root.",
+                    },
+                ),
+                "folder": (
+                    folders,
+                    {
+                        "default": default_folder,
+                        "tooltip": (
+                            "Folder under the selected root. "
+                            "The list updates when you change root or press refresh."
+                        ),
+                    },
+                ),
+                "recursive": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Include text files in subfolders of the selected folder.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("PF_TEXT_BATCH",)
+    RETURN_NAMES = ("texts",)
+    FUNCTION = "load"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Load all text files from one folder under input or output. "
+        "Connect to ProductionFlow Show Texts to flip through them after a single run."
+    )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, root, folder):
+        try:
+            selected = normalize_folder(folder)
+            folders = list_text_folders(root)
+        except ValueError as exc:
+            return str(exc)
+        if selected not in folders:
+            return f"ProductionFlow: folder '{folder}' not found under {root}."
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, root, folder, recursive=False):
+        files = scan_text_files(root, folder, recursive)
+        root_dir = text_root_dir(root)
+        parts = []
+        for name in files:
+            path = os.path.join(root_dir, name)
+            try:
+                stat = os.stat(path)
+                parts.append(f"{name}:{stat.st_mtime_ns}:{stat.st_size}")
+            except OSError:
+                parts.append(f"{name}:missing")
+        return "|".join(parts)
+
+    def load(self, root, folder, recursive=False):
+        files = scan_text_files(root, folder, recursive)
+        if not files:
+            raise ValueError(
+                f"ProductionFlow: no text files found in {root}/{folder}."
+            )
+
+        batch = []
+        for name in files:
+            batch.append({"name": name, "text": read_text_file(root, name, strip=False)})
+        return (batch,)
+
+
+class ProductionFlowShowTexts:
+    """Browse a loaded text-file batch without queueing again."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "texts": (
+                    "PF_TEXT_BATCH",
+                    {
+                        "tooltip": "Connect texts from ProductionFlow Text Folder Load.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "show"
+    OUTPUT_NODE = True
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Show text files loaded by ProductionFlow Text Folder Load. "
+        "After one run, use Previous / Next (or the file list) to flip files without queueing again."
+    )
+
+    def show(self, texts):
+        if not texts:
+            raise ValueError("ProductionFlow: no text files to display.")
+
+        names = []
+        bodies = []
+        for item in texts:
+            names.append(str(item.get("name", "")))
+            bodies.append(str(item.get("text", "")))
+        first = bodies[0] if bodies else ""
+        return {"ui": {"names": names, "texts": bodies, "text": (first,)}}
+
+
+class ProductionFlowImageFolderLoad:
+    """Load every image in a folder for browsing after one run."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        folders = all_text_folders()
+        return {
+            "required": {
+                "root": (
+                    list(TEXT_ROOTS),
+                    {
+                        "default": "input",
+                        "tooltip": "ComfyUI/input or ComfyUI/output. Folder list is relative to this root.",
+                    },
+                ),
+                "folder": (
+                    folders,
+                    {
+                        "default": ".",
+                        "tooltip": (
+                            "Folder under the selected root. "
+                            "The list updates when you change root or press refresh."
+                        ),
+                    },
+                ),
+                "recursive": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Include images in subfolders of the selected folder.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("PF_IMAGE_BATCH",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "load"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Load all images from one folder under input or output. "
+        "Connect to ProductionFlow Show Images to flip through them after a single run."
+    )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, root, folder):
+        try:
+            selected = normalize_folder(folder)
+            folders = list_text_folders(root)
+        except ValueError as exc:
+            return str(exc)
+        if selected not in folders:
+            return f"ProductionFlow: folder '{folder}' not found under {root}."
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, root, folder, recursive=False):
+        files = scan_image_files(root, folder, recursive)
+        root_dir = text_root_dir(root)
+        parts = []
+        for name in files:
+            path = os.path.join(root_dir, name)
+            try:
+                stat = os.stat(path)
+                parts.append(f"{name}:{stat.st_mtime_ns}:{stat.st_size}")
+            except OSError:
+                parts.append(f"{name}:missing")
+        return "|".join(parts)
+
+    def load(self, root, folder, recursive=False):
+        files = scan_image_files(root, folder, recursive)
+        if not files:
+            raise ValueError(
+                f"ProductionFlow: no image files found in {root}/{folder}."
+            )
+
+        batch = []
+        for name in files:
+            batch.append({"name": name, "root": root, "info": file_view_info(root, name)})
+        return (batch,)
+
+
+class ProductionFlowShowImages:
+    """Browse a loaded image-file batch without queueing again."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": (
+                    "PF_IMAGE_BATCH",
+                    {
+                        "tooltip": "Connect images from ProductionFlow Image Folder Load.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "show"
+    OUTPUT_NODE = True
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Show images loaded by ProductionFlow Image Folder Load. "
+        "After one run, use Previous / Next (or the file list) to flip files without queueing again."
+    )
+
+    def show(self, images):
+        if not images:
+            raise ValueError("ProductionFlow: no images to display.")
+
+        names = []
+        infos = []
+        for item in images:
+            names.append(str(item.get("name", "")))
+            info = item.get("info")
+            if not info:
+                info = file_view_info(item.get("root", "input"), item.get("name", ""))
+            infos.append(info)
+        return {"ui": {"names": names, "pf_images": infos}}
 
 
 class ProductionFlowLoraFolderLoader:
@@ -878,9 +1193,227 @@ class ProductionFlowMotionBlurFilmGrain:
         return (out,)
 
 
+class ProductionFlowImageFilters:
+    """Saturation, contrast, warmth, vignette, then grain on an IMAGE batch."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Still or frame batch (N, H, W, C)."}),
+                "saturation": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "tooltip": "1 = unchanged. 0 = grayscale. >1 = punchier color.",
+                    },
+                ),
+                "contrast": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "tooltip": "1 = unchanged. <1 = flatter. >1 = harder lights and darks.",
+                    },
+                ),
+                "warmth": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": -1.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": "0 = unchanged. Positive = warmer (golden). Negative = cooler.",
+                    },
+                ),
+                "vignette": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": "0 = off. Darkens the frame edges. 0.35 = mild. 0.7+ = heavy.",
+                    },
+                ),
+                "grain": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 50.0,
+                        "step": 0.5,
+                        "tooltip": (
+                            "Film grain on the same 8-bit-style scale as Motion Blur Film Grain. "
+                            "0 = off. 2–4 = fine. 6 = mild. 8–12 = noticeable stock."
+                        ),
+                    },
+                ),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "tooltip": "Random seed for grain. Unused when grain is 0.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "process"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Common photo filters on an image or frame batch: saturation, contrast, "
+        "warmth, vignette, then grain. Defaults leave the image unchanged. "
+        "Grain matches ProductionFlow Motion Blur Film Grain."
+    )
+
+    def process(
+        self,
+        images,
+        saturation=1.0,
+        contrast=1.0,
+        warmth=0.0,
+        vignette=0.0,
+        grain=0.0,
+        seed=0,
+    ):
+        if images is None or not isinstance(images, torch.Tensor):
+            raise ValueError("ProductionFlow Image Filters: expected an IMAGE tensor.")
+        if images.ndim != 4:
+            raise ValueError(
+                f"ProductionFlow Image Filters: expected NHWC IMAGE batch, "
+                f"got shape {tuple(images.shape)}."
+            )
+
+        n = images.shape[0]
+        pbar = ProgressBar(max(1, n))
+        out = apply_image_filters(
+            images,
+            saturation=saturation,
+            contrast=contrast,
+            warmth=warmth,
+            vignette=vignette,
+            grain=grain,
+            seed=seed,
+            progress_callback=pbar.update,
+        )
+        if pbar.current < pbar.total:
+            pbar.update_absolute(pbar.total)
+        return (out,)
+
+
+class ProductionFlowFaceSquare:
+    """Detect a face and crop a padded square so Face Segment sees head, not torso."""
+
+    def __init__(self):
+        self.detector = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "Full frame. Use the same image that goes into VAE Encode."}),
+                "scale": (
+                    "FLOAT",
+                    {
+                        "default": 1.8,
+                        "min": 1.0,
+                        "max": 4.0,
+                        "step": 0.05,
+                        "tooltip": "Square size relative to the detected face. 1.5 tight. 1.8 default. 2.2 includes hair/neck.",
+                    },
+                ),
+                "shift": (
+                    "FLOAT",
+                    {
+                        "default": 0.42,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "0.5 = face centered. Lower includes more forehead/hair, less chest.",
+                    },
+                ),
+                "index": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 16,
+                        "tooltip": "Which detected face to use, largest first.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT")
+    RETURN_NAMES = ("crop", "region", "x", "y")
+    FUNCTION = "crop"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "RetinaFace crop of a padded square around the face. Wire crop into Face Segment, "
+        "then ProductionFlow Paste Mask with x/y to put the mask back on the full frame."
+    )
+
+    def crop(self, images, scale=1.8, shift=0.42, index=0):
+        if images is None or not isinstance(images, torch.Tensor) or images.ndim != 4:
+            raise ValueError("ProductionFlow Face Square: expected an IMAGE tensor.")
+        if self.detector is None:
+            self.detector = _retinaface_class()(
+                device=comfy.model_management.get_torch_device(),
+                vis_thres=0.6,
+                keep_top_k=20,
+            )
+        crop, region, x, y = crop_and_region(
+            images, scale=scale, shift=shift, start_index=index, detector=self.detector
+        )
+        return (crop, region, x, y)
+
+
+class ProductionFlowPasteMask:
+    """Paste a crop-sized MASK back onto the full frame at x, y."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK", {"tooltip": "Mask from Face Segment run on the face crop."}),
+                "image": ("IMAGE", {"tooltip": "Full frame used only for canvas size."}),
+                "x": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "tooltip": "Connect x from Face Square."}),
+                "y": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "tooltip": "Connect y from Face Square."}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "paste"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Place a Face Segment crop mask back onto the full image using Face Square x/y. "
+        "Connect the result to Set Latent Noise Mask."
+    )
+
+    def paste(self, mask, image, x, y):
+        if image is None or not isinstance(image, torch.Tensor) or image.ndim != 4:
+            raise ValueError("ProductionFlow Paste Mask: expected an IMAGE tensor for canvas size.")
+        return (paste_mask(mask, image, x, y),)
+
+
 NODE_CLASS_MAPPINGS = {
     "ProductionFlowPromptFolderLoop": ProductionFlowPromptFolderLoop,
     "ProductionFlowPromptFolderSelector": ProductionFlowPromptFolderLoop,
+    "ProductionFlowTextFolderLoad": ProductionFlowTextFolderLoad,
+    "ProductionFlowShowTexts": ProductionFlowShowTexts,
+    "ProductionFlowImageFolderLoad": ProductionFlowImageFolderLoad,
+    "ProductionFlowShowImages": ProductionFlowShowImages,
     "ProductionFlowLoraFolderLoader": ProductionFlowLoraFolderLoader,
     "ProductionFlowLoraTestSaveImage": ProductionFlowLoraTestSaveImage,
     "ProductionFlowNoisyLatentImage": ProductionFlowNoisyLatentImage,
@@ -888,11 +1421,18 @@ NODE_CLASS_MAPPINGS = {
     "ProductionFlowVLMCloudLoader": ProductionFlowVLMCloudLoader,
     "ProductionFlowVLMGenerate": ProductionFlowVLMGenerate,
     "ProductionFlowMotionBlurFilmGrain": ProductionFlowMotionBlurFilmGrain,
+    "ProductionFlowImageFilters": ProductionFlowImageFilters,
+    "ProductionFlowFaceSquare": ProductionFlowFaceSquare,
+    "ProductionFlowPasteMask": ProductionFlowPasteMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ProductionFlowPromptFolderLoop": "ProductionFlow Prompt Folder Loop",
     "ProductionFlowPromptFolderSelector": "ProductionFlow Prompt Folder Loop",
+    "ProductionFlowTextFolderLoad": "ProductionFlow Text Folder Load",
+    "ProductionFlowShowTexts": "ProductionFlow Show Texts",
+    "ProductionFlowImageFolderLoad": "ProductionFlow Image Folder Load",
+    "ProductionFlowShowImages": "ProductionFlow Show Images",
     "ProductionFlowLoraFolderLoader": "ProductionFlow LoRA Folder Loader",
     "ProductionFlowLoraTestSaveImage": "ProductionFlow LoRA Test Save Image",
     "ProductionFlowNoisyLatentImage": "ProductionFlow Noisy Latent Image",
@@ -900,4 +1440,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ProductionFlowVLMCloudLoader": "ProductionFlow VLM Loader (Cloud API)",
     "ProductionFlowVLMGenerate": "ProductionFlow VLM Generate",
     "ProductionFlowMotionBlurFilmGrain": "ProductionFlow Motion Blur Film Grain",
+    "ProductionFlowImageFilters": "ProductionFlow Image Filters",
+    "ProductionFlowFaceSquare": "ProductionFlow Face Square",
+    "ProductionFlowPasteMask": "ProductionFlow Paste Mask",
 }

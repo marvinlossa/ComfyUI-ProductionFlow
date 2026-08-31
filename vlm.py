@@ -212,38 +212,42 @@ _FINAL_ANSWER_RE = re.compile(
 
 
 def strip_thinking_text(text: str) -> str:
-    """Remove Qwen-style thinking blocks; keep the final answer only."""
+    """Remove Qwen-style thinking wrappers; keep the usable answer body.
+
+    Never returns empty when the model produced text. HauhauCS / Qwen3.5 often
+    emit only a Thinking Process block with no Final Answer label — wiping that
+    left 0-byte Save Text files.
+    """
     if not text:
         return text
 
+    original = text
     text = _THINK_TAG_RE.sub("", text).strip()
+    if not text:
+        return ""
 
-    # Free-form "Thinking Process: ..." traces (HauhauCS / some GGUF templates)
     if _THINK_HEADER_RE.match(text):
         parts = _FINAL_ANSWER_RE.split(text)
         if len(parts) >= 2 and parts[-1].strip():
-            text = parts[-1].strip()
-        else:
-            # Prefer last non-reasoning paragraph
-            chunks = re.split(r"\n\s*\n", text)
-            kept = None
-            for chunk in reversed(chunks):
-                c = chunk.strip()
-                if not c:
-                    continue
-                if _THINK_HEADER_RE.match(c):
-                    continue
-                if re.match(r"^(\d+\.|[-*]|\*\*|Step\s+\d+|Task:|Constraint:)", c, re.I):
-                    continue
-                kept = c
-                break
-            if kept:
-                text = kept
-            else:
-                # Entire completion was thinking — nothing useful left
-                text = ""
+            return parts[-1].strip()
+        text = _THINK_HEADER_RE.sub("", text, count=1).strip()
+        if text:
+            return text
+        return original.strip()
 
-    return text.strip()
+    return text
+
+
+def _require_generated_text(text: str, raw: str = "") -> str:
+    out = (text or "").strip()
+    if out:
+        return out
+    raw_len = len(raw or "")
+    raise RuntimeError(
+        "ProductionFlow VLM generated empty text"
+        + (f" (raw {raw_len} chars were stripped)." if raw_len else ".")
+        + " Try enable_thinking=True, raise max_tokens, or check the GGUF chat template."
+    )
 
 
 def apply_no_think_to_messages(messages: list, enable_thinking: bool, model_path: str = "") -> list:
@@ -519,10 +523,10 @@ class ComfyVlmSession:
                 presence_penalty=0.0,
             )
             pbar.update_absolute(3, total=3)
-            text = self.clip.decode(generated_ids)
-            if not enable_thinking:
-                text = strip_thinking_text(text)
-            return text
+            raw = self.clip.decode(generated_ids)
+            text = strip_thinking_text(raw) if not enable_thinking else raw
+            logger.info("TE generate finished (%s chars raw, %s chars out)", len(raw or ""), len(text or ""))
+            return _require_generated_text(text, raw)
         finally:
             # TE weights are managed by Comfy, but drop our ref so free-memory can reclaim.
             self.unload()
@@ -774,21 +778,29 @@ class GgufVlmSession:
             stream=True,
         )
 
-        parts = []
+        content_parts = []
+        reason_parts = []
         step = 0
         for chunk in stream:
             try:
                 delta = chunk["choices"][0].get("delta") or {}
-                piece = delta.get("content") or ""
             except (KeyError, IndexError, TypeError):
-                piece = ""
+                delta = {}
+            piece = delta.get("content") or ""
+            reason = delta.get("reasoning_content") or delta.get("reasoning") or ""
             if piece:
-                parts.append(piece)
+                content_parts.append(piece)
+            if reason:
+                reason_parts.append(reason)
+            if piece or reason:
                 step += 1
                 pbar.update_absolute(min(step, max_tokens), total=max_tokens)
 
         pbar.update_absolute(max_tokens, total=max_tokens)
-        return "".join(parts)
+        content = "".join(content_parts)
+        if content.strip():
+            return content
+        return "".join(reason_parts) or content
 
     def generate(
         self,
@@ -854,13 +866,16 @@ class GgufVlmSession:
                         i + 1,
                         len(attempts),
                     )
-                    text = self._stream_completion(
+                    raw = self._stream_completion(
                         messages, max_tokens, temperature, top_p, top_k, seed, pbar
                     )
-                    if not enable_thinking:
-                        text = strip_thinking_text(text)
-                    logger.info("GGUF generate finished (%s chars)", len(text))
-                    return text
+                    text = strip_thinking_text(raw) if not enable_thinking else raw
+                    logger.info(
+                        "GGUF generate finished (%s chars raw, %s chars out)",
+                        len(raw or ""),
+                        len(text or ""),
+                    )
+                    return _require_generated_text(text, raw)
                 except Exception as e:
                     last_err = e
                     oom = _is_oom_error(e)
