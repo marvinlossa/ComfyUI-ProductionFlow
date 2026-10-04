@@ -484,7 +484,7 @@ app.registerExtension({
       };
     }
 
-    if (nodeData.name === "ProductionFlowImageFolderLoad") {
+    if (nodeData.name === "ProductionFlowImageFolderLoad" || nodeData.name === "ProductionFlowImageFolderLoop") {
       const onNodeCreated = nodeType.prototype.onNodeCreated;
       nodeType.prototype.onNodeCreated = function () {
         onNodeCreated?.apply(this, arguments);

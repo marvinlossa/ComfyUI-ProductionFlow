@@ -102,6 +102,38 @@ async function queueAllPrompts(node) {
 }
 
 
+async function queueAllImages(node) {
+  const root = widgetValue(node, "root", "input");
+  const folder = widgetValue(node, "folder", ".");
+  const recursive = !!widgetValue(node, "recursive", false);
+
+  const infoResponse = await api.fetchApi("/productionflow/image-folder-info", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root, folder, recursive }),
+  });
+  if (!infoResponse.ok) throw new Error(await infoResponse.text());
+  const info = await infoResponse.json();
+  if (!info.count) throw new Error(`No images found in ${root}/${folder}`);
+
+  const graphPrompt = await app.graphToPrompt();
+  const basePrompt = graphPrompt.output;
+  const workflow = graphPrompt.workflow;
+
+  for (let imageIndex = 0; imageIndex < info.count; imageIndex++) {
+    const prompt = structuredClone(basePrompt);
+    setPromptInput(prompt, node.id, "index", imageIndex);
+    removeStaleSaveInputs(prompt);
+    await queuePrompt(prompt, workflow);
+  }
+
+  alert(
+    `ProductionFlow queued ${info.count} image job(s) from "${root}/${folder}". ` +
+      `Each run uses index 0…${info.count - 1} (sorted file order).`
+  );
+}
+
+
 async function queueAllLoras(node) {
   const loraFolder = widgetValue(node, "lora_folder", ".");
   const recursive = !!widgetValue(node, "recursive", false);
@@ -168,6 +200,18 @@ app.registerExtension({
         } catch (error) {
           console.error(error);
           alert(`ProductionFlow LoRA queue failed: ${error.message || error}`);
+        }
+      });
+      return;
+    }
+
+    if (node.comfyClass === "ProductionFlowImageFolderLoop") {
+      node.addWidget("button", "Queue All Images", null, async () => {
+        try {
+          await queueAllImages(node);
+        } catch (error) {
+          console.error(error);
+          alert(`ProductionFlow image queue failed: ${error.message || error}`);
         }
       });
       return;

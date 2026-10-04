@@ -8,6 +8,7 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 import comfy.model_management
+import comfy.samplers
 import comfy.sd
 import comfy.utils
 import folder_paths
@@ -564,6 +565,223 @@ class ProductionFlowImageFolderLoad:
         for name in files:
             batch.append({"name": name, "root": root, "info": file_view_info(root, name)})
         return (batch,)
+
+
+def _prompt_from_folder_loop(node):
+    inputs = node.get("inputs") or {}
+    folder = inputs.get("prompt_folder") or "none"
+    if normalize_folder(folder) == "none":
+        return ""
+    try:
+        index = int(inputs.get("index", 0))
+    except (TypeError, ValueError):
+        return ""
+    prompts = scan_prompts(folder, "", bool(inputs.get("recursive", False)))
+    if index < 0 or index >= len(prompts):
+        return ""
+    return read_prompt_file(prompts[index])
+
+
+def prompt_from_image(path):
+    """Positive prompt that was actually executed for this image.
+
+    ComfyUI's workflow chunk keeps the CLIP widget from the open graph, so a
+    queued prompt-folder loop stamps the same sentence into every PNG. The
+    executed index lives in the API prompt chunk. Resolve that when the text
+    encoder is linked to ProductionFlow Prompt Folder Loop. Otherwise use a
+    literal CLIP text, then the workflow widget.
+    """
+    try:
+        info = Image.open(path).info or {}
+    except OSError:
+        return ""
+
+    api = None
+    raw_api = info.get("prompt")
+    if isinstance(raw_api, str):
+        try:
+            parsed = json.loads(raw_api)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            api = parsed
+
+    literals = []
+    if api:
+        for node in api.values():
+            if not isinstance(node, dict) or node.get("class_type") != "CLIPTextEncode":
+                continue
+            text = (node.get("inputs") or {}).get("text")
+            if isinstance(text, str) and text.strip():
+                literals.append(text.strip())
+                continue
+            if isinstance(text, (list, tuple)) and text:
+                source = api.get(str(text[0]))
+                if not isinstance(source, dict):
+                    continue
+                if source.get("class_type") in (
+                    "ProductionFlowPromptFolderLoop",
+                    "ProductionFlowPromptFolderSelector",
+                ):
+                    resolved = _prompt_from_folder_loop(source)
+                    if resolved:
+                        return resolved
+
+    if literals:
+        return max(literals, key=len)
+
+    workflow = info.get("workflow")
+    if isinstance(workflow, str):
+        try:
+            graph = json.loads(workflow)
+        except json.JSONDecodeError:
+            graph = None
+        widget_texts = []
+        if isinstance(graph, dict):
+            for node in graph.get("nodes") or []:
+                if node.get("type") != "CLIPTextEncode":
+                    continue
+                values = node.get("widgets_values") or []
+                if values and isinstance(values[0], str) and values[0].strip():
+                    widget_texts.append(values[0].strip())
+        if widget_texts:
+            return max(widget_texts, key=len)
+
+    parameters = info.get("parameters")
+    if isinstance(parameters, str) and parameters.strip():
+        return parameters.split("Negative prompt:", 1)[0].strip()
+    return ""
+
+
+def load_image_file(root, relpath):
+    """Load one image the way a single Load Image node would: RGB float image plus mask."""
+    root_dir = text_root_dir(root)
+    normalized = relpath.replace("\\", "/").strip("/")
+    path = os.path.abspath(os.path.join(root_dir, normalized))
+    root_abs = os.path.abspath(root_dir)
+    if not path.startswith(root_abs + os.sep) and path != root_abs:
+        raise ValueError("ProductionFlow: image path escapes the selected root.")
+
+    from PIL import ImageOps, ImageSequence
+
+    img = Image.open(path)
+    output_images = []
+    output_masks = []
+    width = height = None
+    for frame in ImageSequence.Iterator(img):
+        frame = ImageOps.exif_transpose(frame)
+        rgb = frame.convert("RGB")
+        if width is None:
+            width, height = rgb.size
+        if rgb.size != (width, height):
+            continue
+        array = np.array(rgb).astype(np.float32) / 255.0
+        output_images.append(torch.from_numpy(array)[None,])
+        if "A" in frame.getbands():
+            mask = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
+            output_masks.append(1.0 - torch.from_numpy(mask))
+        else:
+            output_masks.append(torch.zeros((64, 64), dtype=torch.float32))
+
+    if len(output_images) > 1:
+        return torch.cat(output_images, dim=0), torch.stack(output_masks, dim=0)
+    return output_images[0], output_masks[0].unsqueeze(0)
+
+
+class ProductionFlowImageFolderLoop:
+    """Pick one image by index, the same way Prompt Folder Loop picks one prompt.
+
+    Batch runs use the Queue All Images button, which queues one job per file
+    with a different index. ProductionFlow Image Folder Load stays the browser.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        folders = all_text_folders()
+        return {
+            "required": {
+                "root": (
+                    list(TEXT_ROOTS),
+                    {
+                        "default": "input",
+                        "tooltip": "ComfyUI/input or ComfyUI/output. Folder list is relative to this root.",
+                    },
+                ),
+                "folder": (
+                    folders,
+                    {
+                        "default": ".",
+                        "tooltip": "Folder under the selected root. The list updates when you change root or press refresh.",
+                    },
+                ),
+                "index": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 100000,
+                        "step": 1,
+                        "tooltip": "Which image to load for this run (0 = first in sorted order). Queue All Images sets this per job.",
+                    },
+                ),
+                "recursive": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Include images in subfolders of the selected folder.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "INT", "INT")
+    RETURN_NAMES = ("image", "mask", "prompt", "image_name", "image_index", "image_count")
+    FUNCTION = "select_image"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = (
+        "Image folder loop. Outputs one image per run by index, plus the positive "
+        "prompt stored in that image's ComfyUI metadata when it has one. "
+        "Use Queue All Images to enqueue every file in the folder."
+    )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, root, folder, index):
+        try:
+            selected = normalize_folder(folder)
+            folders = list_text_folders(root)
+        except ValueError as exc:
+            return str(exc)
+        if selected not in folders:
+            return f"ProductionFlow: folder '{folder}' not found under {root}."
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, root, folder, index, recursive=False):
+        files = scan_image_files(root, folder, recursive)
+        if not files or index < 0 or index >= len(files):
+            return f"{root}|{folder}|{index}|missing|{len(files)}"
+        name = files[index]
+        path = os.path.join(text_root_dir(root), name)
+        try:
+            stat = os.stat(path)
+            stamp = f"{stat.st_mtime_ns}:{stat.st_size}"
+        except OSError:
+            stamp = "missing"
+        return f"{root}|{name}|{index}|{len(files)}|{stamp}"
+
+    def select_image(self, root, folder, index, recursive=False):
+        files = scan_image_files(root, folder, recursive)
+        if not files:
+            raise ValueError(f"ProductionFlow: no image files found in {root}/{folder}.")
+        if index >= len(files):
+            raise ValueError(
+                f"ProductionFlow: image index {index} is out of range for "
+                f"{len(files)} images in {root}/{folder}."
+            )
+        name = files[index]
+        image, mask = load_image_file(root, name)
+        path = os.path.join(text_root_dir(root), name)
+        return (image, mask, prompt_from_image(path), sanitize_path_part(name, "image"), index, len(files))
 
 
 class ProductionFlowShowImages:
@@ -1378,6 +1596,94 @@ class ProductionFlowFaceSquare:
         return (crop, region, x, y)
 
 
+class ProductionFlowEulerAncestral:
+    """KSampler locked to euler_ancestral, with the ancestral eta that stock KSampler hides.
+
+    Krea 2 is a rectified-flow model, so this reaches sample_euler_ancestral_RF.
+    eta 1 and s_noise 1 match the stock sampler. Lower eta fades existing texture
+    without switching the scheduler, which is what keeps freckles in place.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+                "steps": ("INT", {"default": 8, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "denoise": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "eta": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Ancestral noise amount. 1 is stock euler_ancestral. Lower keeps freckle positions and adds fewer new marks. 0 is plain Euler on this same schedule.",
+                }),
+                "s_noise": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 10.0,
+                    "step": 0.05,
+                    "tooltip": "Scale on the ancestral noise sample. 1 matches stock. Leave this alone and use eta.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+    CATEGORY = "ProductionFlow"
+    DESCRIPTION = "euler_ancestral KSampler with an eta control. Use the same scheduler as the first pass."
+
+    def sample(self, model, seed, steps, cfg, scheduler, positive, negative, latent_image, denoise, eta, s_noise):
+        import comfy.sample
+        import latent_preview
+
+        image = latent_image["samples"]
+        image = comfy.sample.fix_empty_latent_channels(
+            model, image, latent_image.get("downscale_ratio_spacial", None), latent_image.get("downscale_ratio_temporal", None)
+        )
+        batch_inds = latent_image["batch_index"] if "batch_index" in latent_image else None
+        noise = comfy.sample.prepare_noise(image, seed, batch_inds)
+        noise_mask = latent_image.get("noise_mask")
+
+        schedule = comfy.samplers.KSampler(
+            model,
+            steps=steps,
+            device=model.load_device,
+            sampler="euler_ancestral",
+            scheduler=scheduler,
+            denoise=denoise,
+            model_options=model.model_options,
+        )
+        sampler = comfy.samplers.ksampler("euler_ancestral", {"eta": float(eta), "s_noise": float(s_noise)})
+        callback = latent_preview.prepare_callback(model, steps)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        samples = comfy.sample.sample_custom(
+            model,
+            noise,
+            cfg,
+            sampler,
+            schedule.sigmas,
+            positive,
+            negative,
+            image,
+            noise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=seed,
+        )
+        out = latent_image.copy()
+        out.pop("downscale_ratio_spacial", None)
+        out.pop("downscale_ratio_temporal", None)
+        out["samples"] = samples
+        return (out,)
+
+
 class ProductionFlowPasteMask:
     """Paste a crop-sized MASK back onto the full frame at x, y."""
 
@@ -1413,6 +1719,7 @@ NODE_CLASS_MAPPINGS = {
     "ProductionFlowTextFolderLoad": ProductionFlowTextFolderLoad,
     "ProductionFlowShowTexts": ProductionFlowShowTexts,
     "ProductionFlowImageFolderLoad": ProductionFlowImageFolderLoad,
+    "ProductionFlowImageFolderLoop": ProductionFlowImageFolderLoop,
     "ProductionFlowShowImages": ProductionFlowShowImages,
     "ProductionFlowLoraFolderLoader": ProductionFlowLoraFolderLoader,
     "ProductionFlowLoraTestSaveImage": ProductionFlowLoraTestSaveImage,
@@ -1424,6 +1731,7 @@ NODE_CLASS_MAPPINGS = {
     "ProductionFlowImageFilters": ProductionFlowImageFilters,
     "ProductionFlowFaceSquare": ProductionFlowFaceSquare,
     "ProductionFlowPasteMask": ProductionFlowPasteMask,
+    "ProductionFlowEulerAncestral": ProductionFlowEulerAncestral,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1432,6 +1740,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ProductionFlowTextFolderLoad": "ProductionFlow Text Folder Load",
     "ProductionFlowShowTexts": "ProductionFlow Show Texts",
     "ProductionFlowImageFolderLoad": "ProductionFlow Image Folder Load",
+    "ProductionFlowImageFolderLoop": "ProductionFlow Image Folder Loop",
     "ProductionFlowShowImages": "ProductionFlow Show Images",
     "ProductionFlowLoraFolderLoader": "ProductionFlow LoRA Folder Loader",
     "ProductionFlowLoraTestSaveImage": "ProductionFlow LoRA Test Save Image",
@@ -1443,4 +1752,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ProductionFlowImageFilters": "ProductionFlow Image Filters",
     "ProductionFlowFaceSquare": "ProductionFlow Face Square",
     "ProductionFlowPasteMask": "ProductionFlow Paste Mask",
+    "ProductionFlowEulerAncestral": "ProductionFlow Euler Ancestral",
 }
